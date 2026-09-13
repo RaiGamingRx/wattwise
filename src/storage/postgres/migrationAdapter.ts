@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto';
 import { Pool } from 'pg';
 import { deserializeState } from '../schema';
 import { PersistenceState } from '../ports';
-import { withClient, withTransaction, withSystemContext } from './db';
+import { withClient, withTransaction, withSystemContext, getAdminPool } from './db';
 
 export interface MigrationSummary {
   accountsMigrated: number;
@@ -24,7 +24,7 @@ export interface MigrationSummary {
  * Decouples legacy BillingCycle from meterId and moves official bill facts into official_bills.
  */
 export class PostgresMigrationAdapter {
-  constructor(private pool: Pool) {}
+  constructor(private pool: Pool = getAdminPool()) {}
 
   async migrateFromLocalStorageJson(
     rawJson: string,
@@ -46,6 +46,7 @@ export class PostgresMigrationAdapter {
       return idMap.get(legacyId)!;
     };
 
+    const targetPool = getAdminPool();
     return withClient(async (client) => {
       return withTransaction(client, async () => {
         return withSystemContext(client, async () => {
@@ -323,6 +324,6 @@ export class PostgresMigrationAdapter {
         };
         });
       });
-    }, this.pool);
+    }, targetPool);
   }
 }

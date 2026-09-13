@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
-import { getDbPool, getAdminPool, closeDbPool, closeAdminPool, withClient, withTenantContext, withSystemContext } from './db';
+import { getDbPool, getAdminPool, closeDbPool, closeAdminPool, withClient, withTransaction, withTenantContext, withSystemContext } from './db';
 import { PostgresEnergyRepository, ConcurrencyError, IntegrityViolationError } from './repository';
+import { PostgresMigrationAdapter } from './migrationAdapter';
+import { developmentFixtureState } from '../localStorageAdapter';
 import { randomUUID } from 'crypto';
 
 describe('WattWise Milestone 0.5.1: Security Attack & Reading Lifecycle Tests', () => {
@@ -1080,6 +1082,190 @@ describe('WattWise Milestone 0.5.1: Security Attack & Reading Lifecycle Tests', 
           { accountId: user.id }
         )
       ).rejects.toThrow(/READING_BASELINE_REQUIRED|READING_REFERENCED/);
+    });
+  });
+
+  // ===========================================================================
+  // E. Trusted System GUC Security Invariant & RLS Bypass Immunity (Tests A–E)
+  // ===========================================================================
+  describe('E. Trusted System GUC Security Invariant & RLS Bypass Immunity', () => {
+    async function setupTwoTenants() {
+      const tenantV = await repo.createAccount({ authUserId: 'victim-account' });
+      const { household: hhV } = await repo.createHousehold({ name: 'Victim Secret Household' }, tenantV.id);
+      const connV = await repo.createConnection({
+        householdId: hhV.id,
+        provider: 'LESCO',
+        referenceNumber: '99999999999999',
+        tariffCode: 'A1-R',
+      }, { accountId: tenantV.id });
+      const meterV = await repo.createMeter({
+        householdId: hhV.id,
+        connectionId: connV.id,
+        serialNumber: 'MTR-VICTIM',
+      }, { accountId: tenantV.id });
+      const cycleV = await repo.createBillingCycle({
+        householdId: hhV.id,
+        connectionId: connV.id,
+        meterId: meterV.id,
+        billingPeriodStart: '2026-09-01',
+        billingPeriodEnd: '2026-09-30',
+        officialReadingDate: '2026-09-25',
+        previousOfficialReading: 100,
+        currentOfficialReading: 300,
+        billedUnits: 200,
+      }, { accountId: tenantV.id });
+      const readingV = await repo.addMeterReading({
+        householdId: hhV.id,
+        connectionId: connV.id,
+        meterId: meterV.id,
+        cycleId: cycleV.id,
+        cumulativeKWh: 150,
+        readingTimestamp: '2026-09-10T10:00:00.000Z',
+        source: 'manual',
+      }, { accountId: tenantV.id });
+
+      const tenantA = await repo.createAccount({ authUserId: 'attacker-account' });
+      const { household: hhA } = await repo.createHousehold({ name: 'Attacker Household' }, tenantA.id);
+
+      return { tenantV, hhV, connV, meterV, cycleV, readingV, tenantA, hhA };
+    }
+
+    // Test A: Runtime role attempting SET app.is_trusted_system = 'true' cannot read other tenants' data
+    it("Test A: Runtime role attempting SET app.is_trusted_system = 'true' cannot read other tenants' data", async () => {
+      const { hhV, readingV, tenantA } = await setupTwoTenants();
+
+      await withClient(async (client) => {
+        // Attacker operating as runtime database role sets session GUC app.is_trusted_system
+        await client.query("SET app.is_trusted_system = 'true'");
+
+        // 1. Without tenant context:
+        const hhResNoContext = await client.query('SELECT * FROM households WHERE id = $1', [hhV.id]);
+        expect(hhResNoContext.rows.length).toBe(0);
+
+        const rdResNoContext = await client.query('SELECT * FROM meter_readings WHERE id = $1', [readingV.id]);
+        expect(rdResNoContext.rows.length).toBe(0);
+
+        // 2. Under Attacker's tenant context:
+        await withTenantContext(client, tenantA.id, async () => {
+          const hhResAsA = await client.query('SELECT * FROM households WHERE id = $1', [hhV.id]);
+          expect(hhResAsA.rows.length).toBe(0);
+
+          const rdResAsA = await client.query('SELECT * FROM meter_readings WHERE id = $1', [readingV.id]);
+          expect(rdResAsA.rows.length).toBe(0);
+        });
+      }, pool);
+    });
+
+    // Test B: Runtime role attempting SELECT set_config('app.is_trusted_system', 'true', false) cannot read other tenants' data
+    it("Test B: Runtime role attempting SELECT set_config('app.is_trusted_system', 'true', false) cannot read other tenants' data", async () => {
+      const { hhV, readingV, tenantA } = await setupTwoTenants();
+
+      await withClient(async (client) => {
+        // Attacker attempts to set session GUC via set_config
+        await client.query("SELECT set_config('app.is_trusted_system', 'true', false)");
+
+        // 1. Without tenant context:
+        const hhRes = await client.query('SELECT * FROM households WHERE id = $1', [hhV.id]);
+        expect(hhRes.rows.length).toBe(0);
+
+        const rdRes = await client.query('SELECT * FROM meter_readings WHERE id = $1', [readingV.id]);
+        expect(rdRes.rows.length).toBe(0);
+
+        // 2. Under Attacker's tenant context:
+        await withTenantContext(client, tenantA.id, async () => {
+          const hhResAsA = await client.query('SELECT * FROM households WHERE id = $1', [hhV.id]);
+          expect(hhResAsA.rows.length).toBe(0);
+
+          const rdResAsA = await client.query('SELECT * FROM meter_readings WHERE id = $1', [readingV.id]);
+          expect(rdResAsA.rows.length).toBe(0);
+        });
+      }, pool);
+    });
+
+    // Test C: Transaction-local set_config('app.is_trusted_system', 'true', true) cannot bypass RLS
+    it("Test C: Transaction-local set_config('app.is_trusted_system', 'true', true) cannot bypass RLS", async () => {
+      const { hhV, readingV, tenantA } = await setupTwoTenants();
+
+      await withClient(async (client) => {
+        await withTransaction(client, async () => {
+          // Attacker attempts transaction-local bypass
+          await client.query("SELECT set_config('app.is_trusted_system', 'true', true)");
+
+          // 1. Without tenant context:
+          const hhRes = await client.query('SELECT * FROM households WHERE id = $1', [hhV.id]);
+          expect(hhRes.rows.length).toBe(0);
+
+          const rdRes = await client.query('SELECT * FROM meter_readings WHERE id = $1', [readingV.id]);
+          expect(rdRes.rows.length).toBe(0);
+
+          // 2. Under Attacker tenant context inside the transaction:
+          await withTenantContext(client, tenantA.id, async () => {
+            const hhResAsA = await client.query('SELECT * FROM households WHERE id = $1', [hhV.id]);
+            expect(hhResAsA.rows.length).toBe(0);
+
+            const rdResAsA = await client.query('SELECT * FROM meter_readings WHERE id = $1', [readingV.id]);
+            expect(rdResAsA.rows.length).toBe(0);
+          });
+        });
+      }, pool);
+    });
+
+    // Test D: Normal tenant queries continue to work under withTenantContext
+    it('Test D: Normal tenant queries continue to work under withTenantContext', async () => {
+      const { hhV, readingV, tenantV, hhA, tenantA } = await setupTwoTenants();
+
+      // Tenant V querying their own data
+      await withClient(async (client) => {
+        await withTenantContext(client, tenantV.id, async () => {
+          const hhRes = await client.query('SELECT * FROM households WHERE id = $1', [hhV.id]);
+          expect(hhRes.rows.length).toBe(1);
+          expect(hhRes.rows[0].name).toBe('Victim Secret Household');
+
+          const rdRes = await client.query('SELECT * FROM meter_readings WHERE id = $1', [readingV.id]);
+          expect(rdRes.rows.length).toBe(1);
+          expect(Number(rdRes.rows[0].cumulative_kwh)).toBe(150);
+        });
+
+        // Tenant A querying their own data
+        await withTenantContext(client, tenantA.id, async () => {
+          const hhRes = await client.query('SELECT * FROM households WHERE id = $1', [hhA.id]);
+          expect(hhRes.rows.length).toBe(1);
+          expect(hhRes.rows[0].name).toBe('Attacker Household');
+
+          // Tenant A querying Tenant V's data still gets 0 rows
+          const victimHhRes = await client.query('SELECT * FROM households WHERE id = $1', [hhV.id]);
+          expect(victimHhRes.rows.length).toBe(0);
+        });
+      }, pool);
+    });
+
+    // Test E: Legitimate system operations (like migrations or test cleanup) still succeed via their proper mechanism
+    it('Test E: Legitimate system operations (like migrations or test cleanup) still succeed via their proper mechanism', async () => {
+      // 1. Migration operation via PostgresMigrationAdapter succeeds via privileged connection
+      const migrationAdapter = new PostgresMigrationAdapter(adminPool);
+      const localState = developmentFixtureState();
+      const summary = await migrationAdapter.migrateState(localState);
+      expect(summary.householdsMigrated).toBeGreaterThanOrEqual(1);
+      expect(summary.readingsMigrated).toBeGreaterThanOrEqual(1);
+
+      // 2. Test cleanup / administrative TRUNCATE succeeds via adminPool / maintenance role
+      await withClient(async (client) => {
+        await withSystemContext(client, async () => {
+          const res = await client.query(`
+            TRUNCATE accounts, households, household_memberships, connections,
+                     meters, billing_cycles, official_bills, meter_readings,
+                     meter_lifecycle_events, idempotency_keys, audit_logs
+            CASCADE
+          `);
+          expect(res).toBeDefined();
+        });
+      }, adminPool);
+
+      // 3. Verify clean state after administrative truncate
+      await withClient(async (client) => {
+        const check = await client.query('SELECT COUNT(*) as count FROM households');
+        expect(Number(check.rows[0].count)).toBe(0);
+      }, adminPool);
     });
   });
 });

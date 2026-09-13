@@ -409,17 +409,10 @@ RETURNS BOOLEAN AS $$
 DECLARE
   current_account TEXT;
   current_household TEXT;
-  is_trusted TEXT;
   user_role TEXT;
   account_uuid UUID;
   household_uuid UUID;
 BEGIN
-  -- Explicit trusted system override only (e.g. system migrations or initial bootstrap)
-  is_trusted := current_setting('app.is_trusted_system', true);
-  IF is_trusted = 'true' THEN
-    RETURN TRUE;
-  END IF;
-
   current_account := current_setting('app.current_account_id', true);
   -- Fail closed: missing or empty account context denies all tenant access
   IF current_account IS NULL OR trim(current_account) = '' THEN
@@ -467,18 +460,23 @@ CREATE OR REPLACE FUNCTION create_household_with_initial_owner(
   p_owner_account_id UUID
 ) RETURNS void AS $$
 DECLARE
-  prev_system TEXT;
+  caller_account TEXT;
 BEGIN
-  prev_system := current_setting('app.is_trusted_system', true);
-  PERFORM set_config('app.is_trusted_system', 'true', true);
+  -- Strict caller validation: ensure caller is authenticated and matches the requested owner
+  caller_account := current_setting('app.current_account_id', true);
+  IF caller_account IS NULL OR trim(caller_account) = '' THEN
+    RAISE EXCEPTION 'Unauthorized: tenant account context required to create household';
+  END IF;
+
+  IF caller_account::UUID <> p_owner_account_id THEN
+    RAISE EXCEPTION 'Unauthorized: cannot create household with mismatched owner context';
+  END IF;
 
   INSERT INTO households (id, name, timezone, version)
   VALUES (p_household_id, p_name, p_timezone, 1);
 
   INSERT INTO household_memberships (id, household_id, account_id, role)
   VALUES (gen_random_uuid(), p_household_id, p_owner_account_id, 'owner');
-
-  PERFORM set_config('app.is_trusted_system', COALESCE(prev_system, ''), true);
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
@@ -518,8 +516,7 @@ CREATE POLICY households_select ON households FOR SELECT
 DROP POLICY IF EXISTS households_insert ON households;
 CREATE POLICY households_insert ON households FOR INSERT
   WITH CHECK (
-    current_setting('app.is_trusted_system', true) = 'true'
-    OR NULLIF(current_setting('app.current_account_id', true), '') IS NOT NULL
+    NULLIF(current_setting('app.current_account_id', true), '') IS NOT NULL
   );
 
 DROP POLICY IF EXISTS households_update ON households;
@@ -532,7 +529,7 @@ CREATE POLICY households_delete ON households FOR DELETE
   USING (is_tenant_authorized(id, ARRAY['owner']));
 
 -- Memberships Policies
--- Prevent privilege escalation: only existing household owners or trusted system can add members
+-- Prevent privilege escalation: only existing household owners can add members
 DROP POLICY IF EXISTS memberships_select ON household_memberships;
 CREATE POLICY memberships_select ON household_memberships FOR SELECT
   USING (
@@ -552,8 +549,7 @@ CREATE POLICY memberships_select ON household_memberships FOR SELECT
 DROP POLICY IF EXISTS memberships_insert ON household_memberships;
 CREATE POLICY memberships_insert ON household_memberships FOR INSERT
   WITH CHECK (
-    current_setting('app.is_trusted_system', true) = 'true'
-    OR is_tenant_authorized(household_id, ARRAY['owner'])
+    is_tenant_authorized(household_id, ARRAY['owner'])
   );
 
 DROP POLICY IF EXISTS memberships_modify ON household_memberships;

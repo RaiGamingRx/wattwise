@@ -160,21 +160,32 @@ export async function withTenantContext<T>(
 
 /**
  * Executes a privileged system operation with explicit audit trail.
+ * Uses a privileged connection (e.g. adminPool / maintenance role)
+ * so operations succeed by database role privilege, NOT by self-asserted GUC flags.
  */
 export async function withSystemContext<T>(
   client: PoolClient,
   fn: () => Promise<T>
 ): Promise<T> {
-  const prevRes = await client.query<{ val: string | null }>(
-    "SELECT current_setting('app.is_trusted_system', true) AS val"
-  );
-  const prevVal = prevRes.rows[0]?.val ?? '';
+  const userRes = await client.query<{ current_user: string }>("SELECT current_user");
+  const currentUser = userRes.rows[0]?.current_user;
 
-  await client.query("SELECT set_config('app.is_trusted_system', 'true', false)");
+  if (currentUser === 'postgres' || currentUser === process.env.PGADMINUSER) {
+    return await fn();
+  }
+
+  // When called on an unprivileged client, execute the privileged operation via the admin pool
+  // so system operations use proper database role-based security rather than self-asserted GUC flags.
+  const adminClient = await getAdminPool().connect();
+  const origQuery = client.query;
+  (client as any).query = function (...args: any[]) {
+    return (adminClient.query as any)(...args);
+  };
   try {
     return await fn();
   } finally {
-    await client.query('SELECT set_config($1, $2, false)', ['app.is_trusted_system', prevVal]);
+    client.query = origQuery;
+    adminClient.release();
   }
 }
 
